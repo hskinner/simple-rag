@@ -1,0 +1,6 @@
+ollama
+click
+numpy
+pgvector
+psycopg[binary]>=3.1.0
+python-dotenv
