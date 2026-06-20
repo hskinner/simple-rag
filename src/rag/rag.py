@@ -1,11 +1,10 @@
 from pathlib import Path
+from typing import Callable
 
 import click
 import subprocess
-import time
 
 import psycopg
-from pgvector.psycopg import register_vector
 
 from ask import model_chat
 from consts import CONTAINER_NAME
@@ -13,8 +12,9 @@ from consts import LANGUAGE_MODEL
 from consts import DEFAULT_TABLE
 from consts import POSTGRES_IMAGE
 from consts import EMBEDDING_DIMENSIONS
-from context import Context, load_env
+from context import Context
 from ingestion import load_file
+from db import create, wait_for_postgres, write_db
 from search import similarity_search
 
 
@@ -27,7 +27,7 @@ def cli():
 @click.option('--table', default=DEFAULT_TABLE)
 @click.option('--embedding-dimensions', default=EMBEDDING_DIMENSIONS, type=int)
 def setup(table: str, embedding_dimensions: int):
-    context = load_env()
+    context = Context.load_env()
 
     existing = subprocess.run(
         ["docker", "ps", "-a", "--filter", f"name={CONTAINER_NAME}", "--format", "{{.Names}}"],
@@ -48,24 +48,21 @@ def setup(table: str, embedding_dimensions: int):
             "-e", f"POSTGRES_PASSWORD={context.postgres_password}",
             "-e", f"POSTGRES_DB={context.postgres_db}",
             "-p", f"{context.postgres_port}:5432",
-            "-d",
-            POSTGRES_IMAGE,
+            "-v", f"{context.database_dir}:/var/lib/postgresql/data",
+            "-d", POSTGRES_IMAGE,
         ])
 
     wait_for_postgres(context)
-    init_schema(context, table, embedding_dimensions)
+    create(context, create_table(table, embedding_dimensions))
 
 
 @cli.command()
 @click.option('--table', default=DEFAULT_TABLE)
 @click.option('--filepath', required=True)
-@click.option('--embedding-dimensions', default=EMBEDDING_DIMENSIONS, type=int)
-def load(table: str, filepath: str, embedding_dimensions: int):
-    context = load_env()
+def load(table: str, filepath: str):
+    context = Context.load_env()
 
     wait_for_postgres(context)
-    init_schema(context, table, embedding_dimensions)
-
     load_file(Path(filepath), context, table)
 
 
@@ -75,7 +72,7 @@ def load(table: str, filepath: str, embedding_dimensions: int):
 @click.option('--top-k', 'top_k', type=int, default=5)
 @click.option('--query')
 def query(table: str, model: str, top_k: int, query: str | None):
-    context = load_env()
+    context = Context.load_env()
 
     wait_for_postgres(context)
 
@@ -97,14 +94,11 @@ def query(table: str, model: str, top_k: int, query: str | None):
 @cli.command()
 @click.option('--table', default=DEFAULT_TABLE)
 def clean(table: str):
-    context = load_env()
+    context = Context.load_env()
 
     wait_for_postgres(context)
+    write_db(context, lambda cursor: cursor.execute(f"DROP TABLE IF EXISTS {table}"))
 
-    with psycopg.connect(context.database_url()) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f'DROP TABLE IF EXISTS {table}')
-    
     print(f'Dropped {table}')
 
 
@@ -113,53 +107,29 @@ def run(cmd: list[str]):
     subprocess.run(cmd, check=True)
 
 
-def wait_for_postgres(context: Context, timeout_seconds: int = 45):
-    print("Waiting for Postgres to accept connections...")
-    deadline = time.time() + timeout_seconds
+def create_table(table: str, embedding_dimensions: int) -> Callable:
+    def impl(cursor: psycopg.Cursor):
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                id BIGSERIAL PRIMARY KEY,
+                source TEXT,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                embedding VECTOR({embedding_dimensions}) NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+        """)
 
-    while time.time() < deadline:
-        try:
-            with psycopg.connect(context.database_url()) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1;")
-            print("Postgres is ready.")
-            return
-        except Exception:
-            time.sleep(1)
-
-    raise TimeoutError("Postgres did not become ready in time.")
-
-
-def init_schema(context: Context, table: str, embedding_dimensions: int):
-    with psycopg.connect(context.database_url()) as conn:
-        with conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        
-            register_vector(conn)
-
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {table} (
-                    id BIGSERIAL PRIMARY KEY,
-                    source TEXT,
-                    chunk_index INTEGER NOT NULL,
-                    content TEXT NOT NULL,
-                    embedding VECTOR({embedding_dimensions}) NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT now()
-                );
-            """)
-
-            # HNSW index for faster approximate nearest-neighbor search.
-            # For small datasets, exact search without this index is also fine.
-            cur.execute(f"""
-                CREATE INDEX IF NOT EXISTS text_chunks_embedding_hnsw_idx
-                ON {table}
-                USING hnsw (embedding vector_cosine_ops);
-            """)
-
-        conn.commit()
-
-    print("Schema initialized.")
-
+        # HNSW index for faster approximate nearest-neighbor search.
+        # For small datasets, exact search without this index is also fine.
+        cursor.execute(f"""
+            CREATE INDEX IF NOT EXISTS text_chunks_embedding_hnsw_idx
+            ON {table}
+            USING hnsw (embedding vector_cosine_ops);
+        """)
+    
+    return impl
+    
 
 if __name__ == '__main__':
     cli()

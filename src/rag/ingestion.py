@@ -4,10 +4,10 @@ from pathlib import Path
 
 import ollama
 import psycopg
-from pgvector.psycopg import register_vector
 
 from context import Context
 from consts import EMBEDDING_MODEL
+from db import write_db
 
 
 def load_file(path: Path, context: Context, destination_table: str):
@@ -31,24 +31,21 @@ def load_file(path: Path, context: Context, destination_table: str):
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
     ]
 
-    with psycopg.connect(context.database_url()) as conn:
-        register_vector(conn)
-
-        with conn.cursor() as cur:
-            cur.executemany(
-                f"""
-                    INSERT INTO {destination_table}(
-                        source,
-                        chunk_index,
-                        content,
-                        embedding
-                    )
-                    VALUES (%s, %s, %s, %s)
-                """,
-                rows,
-            )
-
-        conn.commit()
+    def insert_rows(cursor: psycopg.Cursor):
+        cursor.executemany(
+            f"""
+                INSERT INTO {destination_table}(
+                    source,
+                    chunk_index,
+                    content,
+                    embedding
+                )
+                VALUES (%s, %s, %s, %s)
+            """,
+            rows,
+        )
+    
+    write_db(context, insert_rows)
     
     print(f'Loaded {len(rows)} chunks from {path}')
 
